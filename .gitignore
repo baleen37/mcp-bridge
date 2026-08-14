@@ -1,0 +1,14 @@
+.worktrees/
+.runtime/
+bin/
+
+*.test
+coverage.out
+
+*.db
+*.sqlite
+
+tunnel-token
+*.env
+
+.DS_Store
