@@ -70,7 +70,7 @@ func TestReadWriteEdit(t *testing.T) {
 	}
 }
 
-func TestGrepGlobAndLS(t *testing.T) {
+func TestGrepAndLS(t *testing.T) {
 	service, workspaceRecord := testService(t)
 	if err := os.MkdirAll(filepath.Join(workspaceRecord.Root, "pkg"), 0o755); err != nil {
 		t.Fatal(err)
@@ -91,13 +91,6 @@ func TestGrepGlobAndLS(t *testing.T) {
 	}
 	if !strings.Contains(grep.Text, "main.go:1:needle here") || strings.Contains(grep.Text, "readme.txt") {
 		t.Fatalf("grep output = %q", grep.Text)
-	}
-	glob, err := service.Glob(context.Background(), GlobInput{WorkspaceID: workspaceRecord.ID, Pattern: "**/*.go"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(glob.Text, "main.go") || !strings.Contains(glob.Text, "pkg/other.go") {
-		t.Fatalf("glob output = %q", glob.Text)
 	}
 	ls, err := service.LS(context.Background(), LSInput{WorkspaceID: workspaceRecord.ID, Path: "pkg"})
 	if err != nil {
@@ -125,23 +118,6 @@ func TestGrepDoesNotFollowSymlinkOutsideWorkspace(t *testing.T) {
 	}
 	if result.Matches != 0 || strings.Contains(result.Text, "outside-secret-needle") {
 		t.Fatalf("grep followed symlink outside workspace: %#v", result)
-	}
-}
-
-func TestBashRunsInWorkspaceAndTimesOut(t *testing.T) {
-	service, workspaceRecord := testService(t)
-	result, err := service.Bash(context.Background(), BashInput{WorkspaceID: workspaceRecord.ID, Command: "pwd"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(result.Text, workspaceRecord.Root) {
-		t.Fatalf("bash output = %q", result.Text)
-	}
-	started := time.Now()
-	if _, err := service.Bash(context.Background(), BashInput{WorkspaceID: workspaceRecord.ID, Command: "sleep 1", Timeout: 1}); err == nil {
-		t.Fatal("timeout command unexpectedly succeeded")
-	} else if time.Since(started) > 3*time.Second {
-		t.Fatalf("timeout took too long: %s", time.Since(started))
 	}
 }
 
@@ -193,69 +169,6 @@ func TestExecReturnsNonZeroExitAsResult(t *testing.T) {
 	}
 }
 
-func TestAsyncBashAndWriteStdin(t *testing.T) {
-	service, workspaceRecord := testService(t)
-	service.Sessions = NewProcessSessionManager()
-	t.Cleanup(service.Sessions.Close)
-
-	result, err := service.Bash(context.Background(), BashInput{
-		WorkspaceID: workspaceRecord.ID,
-		Command:     "sleep 0.2; printf 'done'",
-		Async:       true,
-		YieldTimeMS: 10,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Running || result.SessionID == 0 {
-		t.Fatalf("async bash result = %#v, want running session", result)
-	}
-
-	result, err = service.WriteStdin(context.Background(), WriteStdinInput{
-		WorkspaceID: workspaceRecord.ID,
-		SessionID:   result.SessionID,
-		YieldTimeMS: 1000,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Running || result.Text != "done" || result.ExitCode != 0 {
-		t.Fatalf("polled bash result = %#v", result)
-	}
-}
-
-func TestAsyncBashAcceptsStdin(t *testing.T) {
-	service, workspaceRecord := testService(t)
-	service.Sessions = NewProcessSessionManager()
-	t.Cleanup(service.Sessions.Close)
-
-	result, err := service.Bash(context.Background(), BashInput{
-		WorkspaceID: workspaceRecord.ID,
-		Command:     "IFS= read line; printf 'got:%s' \"$line\"",
-		Async:       true,
-		YieldTimeMS: 10,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Running {
-		t.Fatalf("async bash result = %#v, want running session", result)
-	}
-
-	result, err = service.WriteStdin(context.Background(), WriteStdinInput{
-		WorkspaceID: workspaceRecord.ID,
-		SessionID:   result.SessionID,
-		Chars:       "hello\n",
-		YieldTimeMS: 1000,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Running || result.Text != "got:hello" {
-		t.Fatalf("stdin bash result = %#v", result)
-	}
-}
-
 func TestShowChangesReportsGitDiffAndUntrackedFiles(t *testing.T) {
 	service, workspaceRecord := testService(t)
 	runGit := func(args ...string) {
@@ -296,65 +209,5 @@ func TestShowChangesRejectsNonGitWorkspace(t *testing.T) {
 	service, workspaceRecord := testService(t)
 	if _, err := service.ShowChanges(context.Background(), ShowChangesInput{WorkspaceID: workspaceRecord.ID}); err == nil || !strings.Contains(err.Error(), "not a Git repository") {
 		t.Fatalf("error = %v, want Git repository error", err)
-	}
-}
-
-func TestApplyPatchSupportsAddUpdateDeleteAndMove(t *testing.T) {
-	service, record := testService(t)
-	if err := os.WriteFile(filepath.Join(record.Root, "old.txt"), []byte("one\ntwo\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	patch := "*** Begin Patch\n*** Add File: added.txt\n+created\n*** Update File: old.txt\n@@\n-one\n+ONE\n*** Move to: moved.txt\n*** End Patch"
-	if _, err := service.ApplyPatch(context.Background(), ApplyPatchInput{WorkspaceID: record.ID, Input: patch}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := service.ApplyPatch(context.Background(), ApplyPatchInput{WorkspaceID: record.ID, Input: "*** Begin Patch\n*** Delete File: added.txt\n*** End Patch"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(record.Root, "added.txt")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("added file exists: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(record.Root, "old.txt")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("old file exists: %v", err)
-	}
-	content, err := os.ReadFile(filepath.Join(record.Root, "moved.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(content) != "ONE\ntwo\n" {
-		t.Fatalf("moved content = %q", content)
-	}
-}
-
-func TestApplyPatchRejectsInvalidPatchWithoutChangingFiles(t *testing.T) {
-	service, record := testService(t)
-	path := filepath.Join(record.Root, "file.txt")
-	if err := os.WriteFile(path, []byte("unchanged\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, err := service.ApplyPatch(context.Background(), ApplyPatchInput{WorkspaceID: record.ID, Input: "*** Begin Patch\n*** Update File: file.txt\n@@\n-missing\n+changed\n*** End Patch"})
-	if err == nil {
-		t.Fatal("invalid patch unexpectedly succeeded")
-	}
-	content, readErr := os.ReadFile(path)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if string(content) != "unchanged\n" {
-		t.Fatalf("invalid patch changed file: %q", content)
-	}
-	if _, err := service.ApplyPatch(context.Background(), ApplyPatchInput{WorkspaceID: record.ID, Input: "*** Begin Patch\n*** Add File: ../escape.txt\n+secret\n*** End Patch"}); !errors.Is(err, workspace.ErrWorkspaceDenied) {
-		t.Fatalf("traversal error = %v", err)
-	}
-}
-
-func TestExecCommandReturnsNonZeroAsResult(t *testing.T) {
-	service, record := testService(t)
-	result, err := service.ExecCommand(context.Background(), ExecCommandInput{WorkspaceID: record.ID, Command: "printf failure >&2; exit 7"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.ExitCode != 7 || !strings.Contains(result.Text, "failure") {
-		t.Fatalf("result = %#v", result)
 	}
 }

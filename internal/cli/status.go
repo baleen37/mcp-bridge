@@ -159,7 +159,7 @@ func statusPIDError(err error) string {
 }
 
 func commandHasExpectedBinary(command, expected string) bool {
-	for _, field := range strings.Fields(command) {
+	for field := range strings.FieldsSeq(command) {
 		field = strings.Trim(field, "\"'")
 		if filepath.Base(field) == expected {
 			return true
@@ -177,7 +177,7 @@ func statusHTTP(ctx context.Context, client *http.Client, url string, expected i
 	if err != nil {
 		return 0, classifyHTTPError(err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != expected {
 		return response.StatusCode, "unexpected-status"
 	}

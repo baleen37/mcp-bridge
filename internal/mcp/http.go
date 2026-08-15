@@ -2,14 +2,16 @@ package mcp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/baleen37/mcp-bridge/internal/auth"
@@ -18,6 +20,23 @@ import (
 )
 
 const modernMCPProtocolVersion = "2026-07-28"
+
+// knownMCPProtocolVersions lists the revisions this bridge recognizes, newest
+// last. Versions are date strings, so an unrecognized value must not be ordered
+// against them: plain string comparison would sort "garbage" above every real
+// revision and silently pick the wrong transport.
+var knownMCPProtocolVersions = []string{"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"}
+
+// usesModernTransport reports whether the request declares a protocol revision
+// at or beyond modernMCPProtocolVersion, which is served by the stateless
+// transport. Unknown or absent versions fall back to the stateful transport.
+func usesModernTransport(r *http.Request) bool {
+	version := r.Header.Get("Mcp-Protocol-Version")
+	if !slices.Contains(knownMCPProtocolVersions, version) {
+		return false
+	}
+	return version >= modernMCPProtocolVersion
+}
 
 func NewHTTPHandler(cfg config.Config, provider *auth.Provider, server *sdkmcp.Server) http.Handler {
 	return newHTTPHandler(cfg, provider, server, os.Stderr)
@@ -34,20 +53,19 @@ func newHTTPHandler(cfg config.Config, provider *auth.Provider, server *sdkmcp.S
 		Stateless:                  true,
 		DisableLocalhostProtection: true,
 	})
+	// Method-qualified patterns let ServeMux answer a method mismatch with 405
+	// plus the Allow header, and make GET also match HEAD.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", protectedResourceMetadata(cfg))
-	mux.HandleFunc("/.well-known/oauth-authorization-server", authorizationServerMetadata(cfg))
-	mux.HandleFunc("/register", registrationHandler(provider))
-	mux.HandleFunc("/authorize", authorizationHandler(provider, cfg))
-	mux.HandleFunc("/token", tokenHandler(provider))
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", protectedResourceMetadata(cfg))
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", authorizationServerMetadata(cfg))
+	mux.HandleFunc("POST /register", registrationHandler(provider))
+	mux.HandleFunc("GET /authorize", authorizationPageHandler(provider))
+	mux.HandleFunc("POST /authorize", approvalHandler(provider))
+	mux.HandleFunc("POST /token", tokenHandler(provider))
 	mux.Handle("/mcp", protectedMCPHandler(cfg, provider, statefulStream, statelessStream))
 	return requestLogger(logOutput, hostMiddleware(cfg, mux))
 }
@@ -56,13 +74,20 @@ func requestLogger(output io.Writer, next http.Handler) http.Handler {
 	if output == nil {
 		output = io.Discard
 	}
-	logger := log.New(output, "mcp-bridge ", log.LstdFlags)
+	logger := slog.New(slog.NewTextHandler(output, nil))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		response := &statusResponseWriter{ResponseWriter: w}
 		next.ServeHTTP(response, r)
-		logger.Printf("request method=%s path=%s status=%d content_type=%q auth=%t session=%t protocol=%s",
-			r.Method, r.URL.Path, response.statusCode(), response.Header().Get("Content-Type"),
-			strings.TrimSpace(r.Header.Get("Authorization")) != "", r.Header.Get("Mcp-Session-Id") != "", r.Header.Get("Mcp-Protocol-Version"))
+		// Log only the presence of credentials, never their values, and never
+		// the raw query, which carries authorization codes.
+		logger.Info("request",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status", response.statusCode()),
+			slog.String("content_type", response.Header().Get("Content-Type")),
+			slog.Bool("auth", strings.TrimSpace(r.Header.Get("Authorization")) != ""),
+			slog.Bool("session", r.Header.Get("Mcp-Session-Id") != ""),
+			slog.String("protocol", r.Header.Get("Mcp-Protocol-Version")))
 	})
 }
 
@@ -109,11 +134,7 @@ func (w *statusResponseWriter) statusCode() int {
 }
 
 func protectedResourceMetadata(cfg config.Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
-			return
-		}
+	return func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"resource":              cfg.MCPURL(),
 			"authorization_servers": []string{strings.TrimRight(cfg.PublicBaseURL, "/")},
@@ -123,11 +144,7 @@ func protectedResourceMetadata(cfg config.Config) http.HandlerFunc {
 }
 
 func authorizationServerMetadata(cfg config.Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
-			return
-		}
+	return func(w http.ResponseWriter, _ *http.Request) {
 		base := strings.TrimRight(cfg.PublicBaseURL, "/")
 		writeJSON(w, http.StatusOK, map[string]any{
 			"issuer":                                base,
@@ -145,10 +162,6 @@ func authorizationServerMetadata(cfg config.Config) http.HandlerFunc {
 
 func registrationHandler(provider *auth.Provider) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeOAuthError(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
 		var input struct {
 			ClientName   string   `json:"client_name"`
 			RedirectURIs []string `json:"redirect_uris"`
@@ -162,7 +175,7 @@ func registrationHandler(provider *auth.Provider) http.HandlerFunc {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "invalid client metadata")
 			return
 		}
-		writeJSON(w, http.StatusCreated, map[string]any{
+		writeCredentialJSON(w, http.StatusCreated, map[string]any{
 			"client_id":                  client.ID,
 			"client_name":                client.Name,
 			"redirect_uris":              client.RedirectURIs,
@@ -171,55 +184,62 @@ func registrationHandler(provider *auth.Provider) http.HandlerFunc {
 	}
 }
 
-func authorizationHandler(provider *auth.Provider, cfg config.Config) http.HandlerFunc {
+func authorizationPageHandler(provider *auth.Provider) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			input := auth.AuthorizationInput{
-				ClientID: r.URL.Query().Get("client_id"), RedirectURI: r.URL.Query().Get("redirect_uri"),
-				ResponseType: r.URL.Query().Get("response_type"), Scope: r.URL.Query().Get("scope"),
-				State: r.URL.Query().Get("state"), CodeChallenge: r.URL.Query().Get("code_challenge"),
-				CodeChallengeMethod: r.URL.Query().Get("code_challenge_method"), Resource: r.URL.Query().Get("resource"),
-			}
-			page, err := provider.BeginAuthorization(input)
-			if err != nil {
-				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid authorization request")
-				return
-			}
-			data := struct {
-				ApprovalID string
-				ClientName string
-				Scope      string
-				Resource   string
-			}{page.ApprovalID, page.ClientName, page.Scope, page.Resource}
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			if err := approvalTemplate.Execute(w, data); err != nil {
-				return
-			}
-		case http.MethodPost:
-			if err := r.ParseForm(); err != nil {
-				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid approval form")
-				return
-			}
-			redirect, err := provider.Approve(r.FormValue("approval_id"), r.FormValue("password"))
-			if err != nil {
-				writeOAuthError(w, http.StatusUnauthorized, "access_denied", "owner approval failed")
-				return
-			}
-			http.Redirect(w, r, redirect, http.StatusFound)
-		default:
-			writeOAuthError(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+		query := r.URL.Query()
+		input := auth.AuthorizationInput{
+			ClientID: query.Get("client_id"), RedirectURI: query.Get("redirect_uri"),
+			ResponseType: query.Get("response_type"), Scope: query.Get("scope"),
+			State: query.Get("state"), CodeChallenge: query.Get("code_challenge"),
+			CodeChallengeMethod: query.Get("code_challenge_method"), Resource: query.Get("resource"),
 		}
-		_ = cfg
+		page, err := provider.BeginAuthorization(input)
+		if err != nil {
+			// RFC 6749 4.1.2.1: only redirect an error once the client and its
+			// redirect URI check out. Otherwise render it, so an unvalidated URI
+			// can never be used as an open redirect.
+			var redirectable *auth.RedirectableError
+			if errors.As(err, &redirectable) {
+				http.Redirect(w, r, redirectable.RedirectURL(), http.StatusFound)
+				return
+			}
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid authorization request")
+			return
+		}
+		data := struct {
+			ApprovalID string
+			ClientName string
+			Scope      string
+			Resource   string
+		}{page.ApprovalID, page.ClientName, page.Scope, page.Resource}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// The approval ID is a bearer-equivalent secret; keep it out of caches.
+		w.Header().Set("Cache-Control", "no-store")
+		_ = approvalTemplate.Execute(w, data)
+	}
+}
+
+func approvalHandler(provider *auth.Provider) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid approval form")
+			return
+		}
+		redirect, err := provider.Approve(r.FormValue("approval_id"), r.FormValue("password"))
+		if err != nil {
+			if errors.Is(err, auth.ErrTooManyAttempts) {
+				writeOAuthError(w, http.StatusTooManyRequests, "access_denied", "too many failed attempts; try again later")
+				return
+			}
+			writeOAuthError(w, http.StatusUnauthorized, "access_denied", "owner approval failed")
+			return
+		}
+		http.Redirect(w, r, redirect, http.StatusFound)
 	}
 }
 
 func tokenHandler(provider *auth.Provider) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeOAuthError(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
-			return
-		}
 		if err := r.ParseForm(); err != nil {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid token request")
 			return
@@ -237,10 +257,17 @@ func tokenHandler(provider *auth.Provider) http.HandlerFunc {
 			return
 		}
 		if err != nil {
+			// RFC 6749 §5.2 distinguishes a malformed request from a bad grant;
+			// collapsing both into invalid_grant leaves clients unable to tell
+			// a missing parameter from an expired code.
+			if errors.Is(err, auth.ErrInvalidRequest) {
+				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing required parameter")
+				return
+			}
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid grant")
 			return
 		}
-		writeJSON(w, http.StatusOK, response)
+		writeCredentialJSON(w, http.StatusOK, response)
 	}
 }
 
@@ -248,7 +275,7 @@ func protectedMCPHandler(cfg config.Config, provider *auth.Provider, statefulStr
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if localAuthBypassRequest(r) {
 			stream := statefulStream
-			if r.Header.Get("Mcp-Protocol-Version") >= modernMCPProtocolVersion {
+			if usesModernTransport(r) {
 				stream = statelessStream
 			}
 			stream.ServeHTTP(w, r)
@@ -266,7 +293,7 @@ func protectedMCPHandler(cfg config.Config, provider *auth.Provider, statefulStr
 			return
 		}
 		stream := statefulStream
-		if r.Header.Get("Mcp-Protocol-Version") >= modernMCPProtocolVersion {
+		if usesModernTransport(r) {
 			stream = statelessStream
 		}
 		stream.ServeHTTP(w, r)
@@ -330,8 +357,16 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// writeCredentialJSON writes a response carrying tokens or other credentials.
+// RFC 6749 §5.1 requires no-store on these so intermediaries never retain them.
+func writeCredentialJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	writeJSON(w, status, value)
+}
+
 func writeOAuthError(w http.ResponseWriter, status int, code, description string) {
-	writeJSON(w, status, map[string]string{"error": code, "error_description": description})
+	writeCredentialJSON(w, status, map[string]string{"error": code, "error_description": description})
 }
 
 var approvalTemplate = template.Must(template.New("approval").Parse(`<!doctype html>

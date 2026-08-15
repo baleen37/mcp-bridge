@@ -65,7 +65,7 @@ func TestOAuthMCPToolFlow(t *testing.T) {
 		t.Fatalf("initialize response=%#v session=%q", response, sessionID)
 	}
 	listResponse, _ := callMCP(t, server.Client(), server.URL, tokens.AccessToken, sessionID, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": map[string]any{}})
-	if result, ok := listResponse["result"].(map[string]any); !ok || len(result["tools"].([]any)) != 6 {
+	if result, ok := listResponse["result"].(map[string]any); !ok || len(result["tools"].([]any)) != 8 {
 		t.Fatalf("tools/list response=%#v", listResponse)
 	}
 

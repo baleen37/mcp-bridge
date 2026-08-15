@@ -1,0 +1,43 @@
+version: "2"
+
+linters:
+  # Defaults are errcheck, govet, ineffassign, staticcheck, and unused.
+  # gosec is not among them, and it carries the checks that matter most for a
+  # server reachable from the public internet (G112 Slowloris, G114 timeouts).
+  enable:
+    - gosec
+
+  settings:
+    gosec:
+      excludes:
+        # This process exists to run shell commands and read files inside a
+        # workspace the owner configured, so tainted-input and file-inclusion
+        # findings describe the feature rather than a defect. Containment is
+        # enforced by workspace.Registry.Resolve and covered by its tests.
+        - G204
+        - G304
+
+    errcheck:
+      # Writing CLI output to stdout has no recoverable failure mode, and
+      # threading an error back from every print would obscure the commands.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+
+  exclusions:
+    rules:
+      # Tests deliberately build commands from table data and relax permissions
+      # on scratch directories under t.TempDir().
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+      # Close on a read-only handle, and best-effort cleanup of temporary files,
+      # have no failure worth surfacing at the call site.
+      - source: 'defer .*\.Close\(\)$'
+        linters:
+          - errcheck
+      - source: 'defer os\.Remove'
+        linters:
+          - errcheck

@@ -2,14 +2,16 @@ package tools
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/baleen37/mcp-bridge/internal/workspace"
@@ -23,23 +25,9 @@ type GrepInput struct {
 	Limit       int
 }
 
-type GlobInput struct {
-	WorkspaceID string
-	Pattern     string
-	Path        string
-}
-
 type LSInput struct {
 	WorkspaceID string
 	Path        string
-}
-
-type ListDirInput struct {
-	WorkspaceID string
-	Path        string
-	Offset      int
-	Limit       int
-	Depth       int
 }
 
 func (s *Service) Grep(_ context.Context, input GrepInput) (ToolResult, error) {
@@ -58,24 +46,19 @@ func (s *Service) Grep(_ context.Context, input GrepInput) (ToolResult, error) {
 	if err != nil {
 		return ToolResult{}, err
 	}
-	var matches []string
-	err = walkFiles(root, func(filePath, relative string, info fs.FileInfo) error {
+	var matches []grepMatch
+	err = walkFiles(root, func(filePath, relative string, _ fs.FileInfo) error {
 		if input.Include != "" && !globMatch(input.Include, relative) {
 			return nil
 		}
-		workspaceRelative, relErr := filepath.Rel(record.Root, filePath)
-		if relErr != nil {
-			return nil
-		}
-		resolvedPath, resolveErr := s.Workspaces.Resolve(record, workspaceRelative, false)
-		if resolveErr != nil {
-			return nil
-		}
-		file, openErr := os.Open(resolvedPath)
+		file, openErr := os.Open(filePath)
 		if openErr != nil {
 			return nil
 		}
 		defer file.Close()
+		if binary, checkErr := isBinary(file); checkErr != nil || binary {
+			return nil
+		}
 		scanner := bufio.NewScanner(file)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		lineNumber := 0
@@ -83,7 +66,7 @@ func (s *Service) Grep(_ context.Context, input GrepInput) (ToolResult, error) {
 			lineNumber++
 			line := scanner.Text()
 			if pattern.MatchString(line) {
-				matches = append(matches, fmt.Sprintf("%s:%d:%s", relative, lineNumber, line))
+				matches = append(matches, grepMatch{path: relative, line: lineNumber, text: line})
 				if input.Limit > 0 && len(matches) >= input.Limit {
 					return filepath.SkipAll
 				}
@@ -94,43 +77,37 @@ func (s *Service) Grep(_ context.Context, input GrepInput) (ToolResult, error) {
 	if err != nil {
 		return ToolResult{}, err
 	}
-	sort.Strings(matches)
-	return ToolResult{Text: strings.Join(matches, "\n"), Matches: len(matches)}, nil
+	slices.SortFunc(matches, func(a, b grepMatch) int {
+		if c := strings.Compare(a.path, b.path); c != 0 {
+			return c
+		}
+		return a.line - b.line
+	})
+	lines := make([]string, 0, len(matches))
+	for _, match := range matches {
+		lines = append(lines, fmt.Sprintf("%s:%d:%s", match.path, match.line, match.text))
+	}
+	return ToolResult{Text: strings.Join(lines, "\n"), Matches: len(matches)}, nil
 }
 
-func (s *Service) Glob(_ context.Context, input GlobInput) (ToolResult, error) {
-	record, err := s.workspace(input.WorkspaceID)
-	if err != nil {
-		return ToolResult{}, err
+type grepMatch struct {
+	path string
+	line int
+	text string
+}
+
+// isBinary reports whether the head of the file contains a NUL byte, then
+// rewinds so the caller can scan from the start.
+func isBinary(file *os.File) (bool, error) {
+	head := make([]byte, 8000)
+	n, err := file.Read(head)
+	if err != nil && err != io.EOF {
+		return false, err
 	}
-	if input.Pattern == "" {
-		return ToolResult{}, fmt.Errorf("pattern is required")
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false, err
 	}
-	root, err := s.scope(record, input.Path)
-	if err != nil {
-		return ToolResult{}, err
-	}
-	matches := make([]string, 0)
-	if err := filepath.WalkDir(root, func(filePath string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if entry.IsDir() {
-			if entry.Name() == ".git" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		relative, relErr := filepath.Rel(record.Root, filePath)
-		if relErr == nil && globMatch(input.Pattern, relative) {
-			matches = append(matches, filepath.ToSlash(relative))
-		}
-		return nil
-	}); err != nil {
-		return ToolResult{}, err
-	}
-	sort.Strings(matches)
-	return ToolResult{Text: strings.Join(matches, "\n"), Matches: len(matches)}, nil
+	return bytes.IndexByte(head[:n], 0) >= 0, nil
 }
 
 func (s *Service) LS(_ context.Context, input LSInput) (ToolResult, error) {
@@ -158,82 +135,8 @@ func (s *Service) LS(_ context.Context, input LSInput) (ToolResult, error) {
 		}
 		lines = append(lines, fmt.Sprintf("%s\t%s\t%d", entry.Name(), kind, size))
 	}
-	sort.Strings(lines)
+	slices.Sort(lines)
 	return ToolResult{Text: strings.Join(lines, "\n"), Matches: len(lines)}, nil
-}
-
-func (s *Service) ListDir(ctx context.Context, input ListDirInput) (ToolResult, error) {
-	if input.Offset < 0 || input.Limit < 0 || input.Depth < 0 {
-		return ToolResult{}, fmt.Errorf("offset, limit, and depth must not be negative")
-	}
-	if input.Depth == 0 {
-		result, err := s.LS(ctx, LSInput{WorkspaceID: input.WorkspaceID, Path: input.Path})
-		if err != nil {
-			return ToolResult{}, err
-		}
-		return paginateResult(result, input.Offset, input.Limit), nil
-	}
-	record, err := s.workspace(input.WorkspaceID)
-	if err != nil {
-		return ToolResult{}, err
-	}
-	root, err := s.Workspaces.Resolve(record, input.Path, false)
-	if err != nil {
-		return ToolResult{}, err
-	}
-	var lines []string
-	err = filepath.WalkDir(root, func(pathValue string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if pathValue == root {
-			return nil
-		}
-		relative, relErr := filepath.Rel(root, pathValue)
-		if relErr != nil {
-			return nil
-		}
-		level := strings.Count(relative, string(filepath.Separator)) + 1
-		if level > input.Depth {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		kind := "file"
-		if entry.IsDir() {
-			kind = "dir"
-		}
-		size := int64(0)
-		if info, infoErr := entry.Info(); infoErr == nil {
-			size = info.Size()
-		}
-		lines = append(lines, fmt.Sprintf("%s\t%s\t%d", filepath.ToSlash(relative), kind, size))
-		return nil
-	})
-	if err != nil {
-		return ToolResult{}, err
-	}
-	sort.Strings(lines)
-	result := ToolResult{Text: strings.Join(lines, "\n"), Matches: len(lines)}
-	return paginateResult(result, input.Offset, input.Limit), nil
-}
-
-func paginateResult(result ToolResult, offset, limit int) ToolResult {
-	lines := strings.Split(result.Text, "\n")
-	if result.Text == "" {
-		lines = nil
-	}
-	if offset >= len(lines) {
-		lines = nil
-	} else {
-		lines = lines[offset:]
-	}
-	if limit > 0 && len(lines) > limit {
-		lines = lines[:limit]
-	}
-	result.Text, result.Matches = strings.Join(lines, "\n"), len(lines)
-	return result
 }
 
 func (s *Service) scope(record workspace.Record, relativePath string) (string, error) {
@@ -243,6 +146,13 @@ func (s *Service) scope(record workspace.Record, relativePath string) (string, e
 	return s.Workspaces.Resolve(record, relativePath, false)
 }
 
+// skippedDirs are build and dependency directories that rarely contain
+// source worth searching.
+var skippedDirs = map[string]bool{
+	".git": true, ".next": true, ".venv": true, "__pycache__": true,
+	"build": true, "dist": true, "node_modules": true, "target": true, "vendor": true,
+}
+
 func walkFiles(root string, callback func(filePath, relative string, info fs.FileInfo) error) error {
 	base := root
 	return filepath.Walk(root, func(filePath string, info fs.FileInfo, err error) error {
@@ -250,9 +160,15 @@ func walkFiles(root string, callback func(filePath, relative string, info fs.Fil
 			return nil
 		}
 		if info.IsDir() {
-			if info.Name() == ".git" {
+			if skippedDirs[info.Name()] {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		// filepath.Walk lstats entries, so symlinks arrive as symlinks and are
+		// never descended into. Restricting to regular files therefore keeps
+		// reads inside the canonical root without a per-file resolve.
+		if !info.Mode().IsRegular() {
 			return nil
 		}
 		relative, relErr := filepath.Rel(base, filePath)
@@ -269,8 +185,8 @@ func globMatch(pattern, value string) bool {
 	if ok, _ := path.Match(pattern, value); ok {
 		return true
 	}
-	if strings.HasPrefix(pattern, "**/") {
-		short := strings.TrimPrefix(pattern, "**/")
+	if after, ok := strings.CutPrefix(pattern, "**/"); ok {
+		short := after
 		if ok, _ := path.Match(short, value); ok {
 			return true
 		}

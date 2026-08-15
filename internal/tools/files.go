@@ -1,15 +1,15 @@
 package tools
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
-	"sync"
 
 	"github.com/baleen37/mcp-bridge/internal/workspace"
 )
@@ -17,21 +17,15 @@ import (
 type Service struct {
 	Workspaces *workspace.Registry
 	Command    CommandRunner
-	Sessions   *ProcessSessionManager
 	HTTPClient *http.Client
-	sessionsMu sync.Mutex
 }
 
 type ToolResult struct {
-	Text       string `json:"text"`
-	ExitCode   int    `json:"exit_code"`
-	Truncated  bool   `json:"truncated,omitempty"`
-	Matches    int    `json:"matches,omitempty"`
-	SessionID  int    `json:"session_id,omitempty"`
-	Running    bool   `json:"running"`
-	Signal     string `json:"signal,omitempty"`
-	WallTimeMS int64  `json:"wall_time_ms,omitempty"`
-	SHA256     string `json:"sha256,omitempty"`
+	Text      string `json:"text"`
+	ExitCode  int    `json:"exit_code"`
+	Truncated bool   `json:"truncated,omitempty"`
+	Matches   int    `json:"matches,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
 }
 
 type ReadInput struct {
@@ -58,23 +52,9 @@ type EditInput struct {
 	Edits       []Edit
 }
 
-func (s *Service) processSessions() *ProcessSessionManager {
-	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
-	if s.Sessions == nil {
-		s.Sessions = NewProcessSessionManager()
-	}
-	return s.Sessions
-}
-
-func (s *Service) Close() {
-	s.sessionsMu.Lock()
-	sessions := s.Sessions
-	s.sessionsMu.Unlock()
-	if sessions != nil {
-		sessions.Close()
-	}
-}
+// Close releases resources held by the service. It currently has nothing to
+// release, and exists so callers can defer cleanup without caring.
+func (s *Service) Close() {}
 
 func (s *Service) Read(_ context.Context, input ReadInput) (ToolResult, error) {
 	record, err := s.workspace(input.WorkspaceID)
@@ -137,12 +117,12 @@ func (s *Service) Edit(_ context.Context, input EditInput) (ToolResult, error) {
 			return ToolResult{}, errors.New("oldText must not be empty")
 		}
 		start := strings.Index(text, edit.OldText)
-		if start < 0 || strings.Index(text[start+len(edit.OldText):], edit.OldText) >= 0 {
+		if start < 0 || strings.Contains(text[start+len(edit.OldText):], edit.OldText) {
 			return ToolResult{}, fmt.Errorf("oldText must match exactly once: %q", edit.OldText)
 		}
 		ranges = append(ranges, editRange{start: start, end: start + len(edit.OldText), edit: edit})
 	}
-	sort.Slice(ranges, func(i, j int) bool { return ranges[i].start < ranges[j].start })
+	slices.SortFunc(ranges, func(a, b editRange) int { return cmp.Compare(a.start, b.start) })
 	for i := 1; i < len(ranges); i++ {
 		if ranges[i].start < ranges[i-1].end {
 			return ToolResult{}, errors.New("edits overlap")

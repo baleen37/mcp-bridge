@@ -214,3 +214,162 @@ func mustParseCode(t *testing.T, redirect string) string {
 	}
 	return code
 }
+
+// registerTestClient registers a client and returns its ID and redirect URI.
+func registerTestClient(t *testing.T, provider *Provider) (string, string) {
+	t.Helper()
+	const redirect = "https://chatgpt.com/connector_platform_oauth_redirect"
+	client, err := provider.RegisterClient(RegisterInput{Name: "test", RedirectURIs: []string{redirect}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client.ID, redirect
+}
+
+func TestAuthorizationErrorsRedirectOnlyAfterClientIsValidated(t *testing.T) {
+	provider := testProvider(t)
+	clientID, redirect := registerTestClient(t, provider)
+
+	valid := AuthorizationInput{
+		ClientID: clientID, RedirectURI: redirect, ResponseType: "code",
+		Scope: "devspace", State: "xyz", CodeChallenge: "challenge", CodeChallengeMethod: "S256",
+	}
+
+	t.Run("unknown client renders, never redirects", func(t *testing.T) {
+		input := valid
+		input.ClientID = "does-not-exist"
+		_, err := provider.BeginAuthorization(input)
+		var redirectable *RedirectableError
+		if errors.As(err, &redirectable) {
+			t.Fatal("unknown client produced a redirect; that is an open redirect")
+		}
+	})
+
+	t.Run("unregistered redirect URI renders, never redirects", func(t *testing.T) {
+		input := valid
+		input.RedirectURI = "https://attacker.example/steal"
+		_, err := provider.BeginAuthorization(input)
+		var redirectable *RedirectableError
+		if errors.As(err, &redirectable) {
+			t.Fatal("unregistered redirect URI produced a redirect; that is an open redirect")
+		}
+	})
+
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*AuthorizationInput)
+		want   string
+	}{
+		{"bad response type", func(i *AuthorizationInput) { i.ResponseType = "token" }, "unsupported_response_type"},
+		{"bad scope", func(i *AuthorizationInput) { i.Scope = "other" }, "invalid_scope"},
+		{"missing PKCE", func(i *AuthorizationInput) { i.CodeChallenge = "" }, "invalid_request"},
+		{"plain PKCE", func(i *AuthorizationInput) { i.CodeChallengeMethod = "plain" }, "invalid_request"},
+		{"wrong resource", func(i *AuthorizationInput) { i.Resource = "https://elsewhere.test/mcp" }, "invalid_target"},
+	} {
+		t.Run(testCase.name+" redirects to the client", func(t *testing.T) {
+			input := valid
+			testCase.mutate(&input)
+			_, err := provider.BeginAuthorization(input)
+			var redirectable *RedirectableError
+			if !errors.As(err, &redirectable) {
+				t.Fatalf("err = %v, want a RedirectableError so the client learns why", err)
+			}
+			if redirectable.Code != testCase.want {
+				t.Errorf("error code = %q, want %q", redirectable.Code, testCase.want)
+			}
+			target, parseErr := url.Parse(redirectable.RedirectURL())
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			if got := target.Query().Get("error"); got != testCase.want {
+				t.Errorf("redirect error param = %q, want %q", got, testCase.want)
+			}
+			if got := target.Query().Get("state"); got != "xyz" {
+				t.Errorf("redirect state = %q, want %q", got, "xyz")
+			}
+			if !strings.HasPrefix(redirectable.RedirectURL(), redirect) {
+				t.Errorf("redirect target = %q, want it under %q", redirectable.RedirectURL(), redirect)
+			}
+		})
+	}
+}
+
+func TestResourceComparisonToleratesCaseAndTrailingSlash(t *testing.T) {
+	for _, testCase := range []struct {
+		left, right string
+		want        bool
+	}{
+		{"https://example.test/mcp", "https://example.test/mcp", true},
+		{"HTTPS://EXAMPLE.TEST/mcp", "https://example.test/mcp", true},
+		{"https://example.test/mcp/", "https://example.test/mcp", true},
+		{"https://example.test/mcp", "https://other.test/mcp", false},
+		{"https://example.test/other", "https://example.test/mcp", false},
+	} {
+		if got := sameResource(testCase.left, testCase.right); got != testCase.want {
+			t.Errorf("sameResource(%q, %q) = %v, want %v", testCase.left, testCase.right, got, testCase.want)
+		}
+	}
+}
+
+func TestApproveLocksOutAfterRepeatedWrongPasswords(t *testing.T) {
+	provider := testProvider(t)
+	if err := provider.InitializeOwner([]byte("owner-password-123456")); err != nil {
+		t.Fatal(err)
+	}
+	clientID, redirect := registerTestClient(t, provider)
+	begin := func() string {
+		t.Helper()
+		page, err := provider.BeginAuthorization(AuthorizationInput{
+			ClientID: clientID, RedirectURI: redirect, ResponseType: "code",
+			Scope: "devspace", CodeChallenge: "challenge", CodeChallengeMethod: "S256",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return page.ApprovalID
+	}
+
+	for attempt := range maxApprovalAttempts {
+		if _, err := provider.Approve(begin(), "wrong-password"); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("attempt %d: err = %v, want ErrUnauthorized", attempt, err)
+		}
+	}
+
+	// The correct password must now be refused too, otherwise the limit only
+	// slows an attacker down rather than stopping the guessing.
+	if _, err := provider.Approve(begin(), "owner-password-123456"); !errors.Is(err, ErrTooManyAttempts) {
+		t.Fatalf("after lockout err = %v, want ErrTooManyAttempts", err)
+	}
+}
+
+func TestApproveResetsAttemptsAfterSuccess(t *testing.T) {
+	provider := testProvider(t)
+	if err := provider.InitializeOwner([]byte("owner-password-123456")); err != nil {
+		t.Fatal(err)
+	}
+	clientID, redirect := registerTestClient(t, provider)
+	begin := func() string {
+		t.Helper()
+		page, err := provider.BeginAuthorization(AuthorizationInput{
+			ClientID: clientID, RedirectURI: redirect, ResponseType: "code",
+			Scope: "devspace", CodeChallenge: "challenge", CodeChallengeMethod: "S256",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return page.ApprovalID
+	}
+
+	if _, err := provider.Approve(begin(), "wrong-password"); !errors.Is(err, ErrUnauthorized) {
+		t.Fatal(err)
+	}
+	if _, err := provider.Approve(begin(), "owner-password-123456"); err != nil {
+		t.Fatalf("correct password rejected: %v", err)
+	}
+	// A success clears the counter, so the budget is available again.
+	for attempt := range maxApprovalAttempts - 1 {
+		if _, err := provider.Approve(begin(), "wrong-password"); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("attempt %d after reset: err = %v, want ErrUnauthorized", attempt, err)
+		}
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -263,12 +264,7 @@ func canonicalExisting(path string) (string, error) {
 }
 
 func hasParentComponent(path string) bool {
-	for _, component := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
-		if component == ".." {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }), "..")
 }
 
 func isInside(path string, roots ...string) bool {

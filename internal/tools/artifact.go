@@ -70,20 +70,20 @@ func (s *Service) DownloadArtifact(ctx context.Context, input DownloadArtifactIn
 	hash := sha256.New()
 	written, err := io.CopyN(io.MultiWriter(temp, hash), response.Body, maxArtifactBytes+1)
 	if err != nil && !errors.Is(err, io.EOF) {
-		temp.Close()
+		_ = temp.Close()
 		return ToolResult{}, err
 	}
 	if written > maxArtifactBytes {
-		temp.Close()
+		_ = temp.Close()
 		return ToolResult{}, errors.New("artifact exceeds maximum size")
 	}
 	digest := hex.EncodeToString(hash.Sum(nil))
 	if expectedHash != "" && !strings.EqualFold(expectedHash, digest) {
-		temp.Close()
+		_ = temp.Close()
 		return ToolResult{}, errors.New("artifact SHA-256 mismatch")
 	}
 	if err := temp.Chmod(0o600); err != nil {
-		temp.Close()
+		_ = temp.Close()
 		return ToolResult{}, err
 	}
 	if err := temp.Close(); err != nil {

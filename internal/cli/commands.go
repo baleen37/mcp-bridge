@@ -219,7 +219,16 @@ func executeStart(ctx context.Context, args []string, _ io.Writer, _ io.Writer) 
 	}
 	defer state.Close()
 	defer service.Close()
-	server := &http.Server{Addr: cfg.Address(), Handler: handler}
+	go purgeExpiredPeriodically(ctx, state)
+	// The tunnel exposes this server publicly, so bound the time a client may
+	// hold a connection open before completing its headers (Slowloris). Reads
+	// and writes stay generous because exec_command streams long tool output.
+	server := &http.Server{
+		Addr:              cfg.Address(),
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	if os.Getenv("MCP_BRIDGE_SKIP_TUNNEL") == "1" {
 		err := serveUntilContext(ctx, server)
 		if errors.Is(err, context.Canceled) {
@@ -300,7 +309,7 @@ func smokeOrigin(client *http.Client, name, origin string, out io.Writer) bool {
 			response, requestErr := client.Do(request)
 			if requestErr == nil {
 				status = response.StatusCode
-				response.Body.Close()
+				_ = response.Body.Close()
 			}
 		}
 		pass := status == endpoint.expected
@@ -452,7 +461,7 @@ func runDoctor(cfg config.Config, out io.Writer, environment doctorEnvironment) 
 			response, requestErr := environment.Client.Do(request)
 			if requestErr == nil {
 				status = response.StatusCode
-				response.Body.Close()
+				_ = response.Body.Close()
 			}
 		}
 		check(name, status == expected)
@@ -571,11 +580,30 @@ func buildHTTPApp() (config.Config, *store.Store, *tools.Service, http.Handler, 
 		_ = state.Close()
 		return config.Config{}, nil, nil, nil, errors.New("owner is not initialized")
 	}
+	if err := state.PurgeExpired(time.Now()); err != nil {
+		_ = state.Close()
+		return config.Config{}, nil, nil, nil, err
+	}
 	provider := &auth.Provider{Store: state, PublicBaseURL: cfg.PublicBaseURL, RedirectHosts: cfg.OAuthRedirectHosts}
 	registry := &workspace.Registry{AllowedRoots: cfg.AllowedRoots, WorktreeRoot: cfg.WorktreeRoot, Store: state, Git: workspace.ExecGitRunner{}}
 	service := &tools.Service{Workspaces: registry, Command: tools.OSCommandRunner{}}
 	sdkServer := bridgemcp.NewServer(cfg, provider, registry, service)
 	return cfg, state, service, bridgemcp.NewHTTPHandler(cfg, provider, sdkServer), nil
+}
+
+// purgeExpiredPeriodically sweeps expired OAuth records while the server runs.
+// Startup alone is not enough: this process is meant to stay up across logins.
+func purgeExpiredPeriodically(ctx context.Context, state *store.Store) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = state.PurgeExpired(time.Now())
+		}
+	}
 }
 
 func serveUntilContext(ctx context.Context, server *http.Server) error {

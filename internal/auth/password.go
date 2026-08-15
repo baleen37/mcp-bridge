@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -38,7 +39,7 @@ func VerifyPassword(encoded, password []byte) bool {
 		return false
 	}
 	params := map[string]uint32{}
-	for _, item := range strings.Split(parts[2], ",") {
+	for item := range strings.SplitSeq(parts[2], ",") {
 		key, value, ok := strings.Cut(item, "=")
 		if !ok {
 			return false
@@ -52,7 +53,10 @@ func VerifyPassword(encoded, password []byte) bool {
 	memory, okMemory := params["m"]
 	timeCost, okTime := params["t"]
 	threads, okThreads := params["p"]
-	if !okMemory || !okTime || !okThreads || memory == 0 || timeCost == 0 || threads == 0 {
+	// argon2 takes the thread count as a uint8, so reject anything that would
+	// silently wrap on conversion rather than deriving a key with the wrong
+	// parallelism.
+	if !okMemory || !okTime || !okThreads || memory == 0 || timeCost == 0 || threads == 0 || threads > math.MaxUint8 {
 		return false
 	}
 	salt, err := base64.RawStdEncoding.DecodeString(parts[3])
@@ -60,9 +64,11 @@ func VerifyPassword(encoded, password []byte) bool {
 		return false
 	}
 	want, err := base64.RawStdEncoding.DecodeString(parts[4])
-	if err != nil || len(want) == 0 {
+	// The key length is echoed back into IDKey, so bound it to what HashPassword
+	// produces rather than trusting the encoded value.
+	if err != nil || len(want) != argonKeyLen {
 		return false
 	}
-	got := argon2.IDKey(password, salt, timeCost, memory, uint8(threads), uint32(len(want)))
+	got := argon2.IDKey(password, salt, timeCost, memory, uint8(threads), argonKeyLen)
 	return subtle.ConstantTimeCompare(got, want) == 1
 }

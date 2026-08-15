@@ -117,10 +117,6 @@ func UninstallLaunchAgent(ctx context.Context, cfg config.Config, runner Command
 	return nil
 }
 
-func launchAgentPath(home string) string {
-	return filepath.Join(home, "Library", "LaunchAgents", launchAgentLabel+".plist")
-}
-
 func writeKeyString(document *strings.Builder, key, value string) {
 	document.WriteString("<key>")
 	var escaped bytes.Buffer
