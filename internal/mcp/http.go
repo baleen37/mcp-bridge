@@ -234,7 +234,13 @@ func approvalHandler(provider *auth.Provider) http.HandlerFunc {
 			writeOAuthError(w, http.StatusUnauthorized, "access_denied", "owner approval failed")
 			return
 		}
-		http.Redirect(w, r, redirect, http.StatusFound)
+		// gosec reads redirect as attacker-controlled because it cannot follow the
+		// value back past the store. It is not: Approve builds it from the stored
+		// code's RedirectURI, RegisterClient accepts a redirect only when
+		// allowedRedirectURI passes it, and BeginAuthorization requires an exact
+		// match against that registered list. The form supplies the approval ID and
+		// password, never the destination.
+		http.Redirect(w, r, redirect, http.StatusFound) //nolint:gosec // G710: destination is validated at registration and matched exactly at authorization
 	}
 }
 
