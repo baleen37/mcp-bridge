@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -65,8 +66,34 @@ func TestOAuthMCPToolFlow(t *testing.T) {
 		t.Fatalf("initialize response=%#v session=%q", response, sessionID)
 	}
 	listResponse, _ := callMCP(t, server.Client(), server.URL, tokens.AccessToken, sessionID, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": map[string]any{}})
-	if result, ok := listResponse["result"].(map[string]any); !ok || len(result["tools"].([]any)) != 8 {
+	// Assert on the names rather than the count, so adding a tool does not fail
+	// here for the wrong reason, and a rename is caught instead of hidden.
+	result, ok := listResponse["result"].(map[string]any)
+	if !ok {
 		t.Fatalf("tools/list response=%#v", listResponse)
+	}
+	listed, ok := result["tools"].([]any)
+	if !ok {
+		t.Fatalf("tools/list response=%#v", listResponse)
+	}
+	names := make([]string, 0, len(listed))
+	for _, entry := range listed {
+		tool, isMap := entry.(map[string]any)
+		if !isMap {
+			t.Fatalf("tool entry=%#v", entry)
+		}
+		name, isString := tool["name"].(string)
+		if !isString {
+			t.Fatalf("tool entry=%#v", entry)
+		}
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	// download_artifact is absent because this server runs with artifact
+	// downloads disabled.
+	want := []string{"apply_patch", "exec_command", "grep_files", "list_dir", "open_workspace", "read_file", "show_changes", "write_file"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("tools = %v, want %v", names, want)
 	}
 
 	opened := callTool(t, server.Client(), server.URL, tokens.AccessToken, sessionID, 3, "open_workspace", map[string]any{"path": project, "mode": "checkout"})
