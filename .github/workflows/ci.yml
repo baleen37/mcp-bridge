@@ -33,4 +33,7 @@ jobs:
           cache: true
       - uses: golangci/golangci-lint-action@v9
         with:
+          # Pinned so a new upstream release cannot turn a green branch red on
+          # its own, and so the same version can be run locally.
+          version: v2.12.2
           args: --timeout=5m
