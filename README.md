@@ -3,8 +3,9 @@
 A local MCP server written in Go. It binds to `127.0.0.1:7676` and exposes your machine to
 remote MCP clients — such as ChatGPT web — through a Cloudflare Named Tunnel.
 
-The server provides these tools: `open_workspace`, `read_file`, `grep_files`, `list_dir`,
-`apply_patch`, and `exec_command`. Enabling artifact downloads adds `download_artifact`.
+The server provides these tools: `open_workspace`, `read_file`, `write_file`, `grep_files`,
+`list_dir`, `show_changes`, `apply_patch`, and `exec_command`. Enabling artifact downloads
+adds `download_artifact`.
 
 > **Security note:** this grants a remote MCP client the ability to read files and run shell
 > commands on your machine, bounded by the allowed root you configure. Keep that root as
@@ -160,7 +161,14 @@ inside that workspace root.
 - `max_output_tokens` is applied to real output at 4 bytes per token; total output never
   exceeds 1 MiB.
 - `read_file`, `grep_files`, and `list_dir` are inspection tools that return `{ "text": "..." }`.
+  `read_file` takes a 1-based `offset` line number, and `grep_files` takes a Go RE2 regular
+  expression as `pattern` with an optional filename glob as `include`.
 - `apply_patch` replaces an `old_text` block that matches exactly once.
+- `write_file` writes `content` to `path`, creating parent directories as needed. Use it for
+  new files, since `apply_patch` can only replace text that already exists.
+- `show_changes` reports uncommitted work in a Git workspace as porcelain status followed by a
+  diff against `HEAD`, and returns
+  `{ "text", "files_changed", "additions", "deletions", "untracked", "truncated" }`.
 - `exec_command` returns `{ "text", "exit_code", "truncated", "timed_out" }`. An ordinary
   non-zero exit is returned as a normal result, not an error.
 

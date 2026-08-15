@@ -34,7 +34,7 @@ func (s *Service) ShowChanges(ctx context.Context, input ShowChangesInput) (Chan
 		return ChangesResult{}, err
 	}
 	if s.Workspaces.Git == nil {
-		return ChangesResult{}, errors.New("Git workspace support is not configured")
+		return ChangesResult{}, errors.New("git workspace support is not configured")
 	}
 	root, err := s.gitOutput(ctx, record.Root, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -63,13 +63,13 @@ func (s *Service) ShowChanges(ctx context.Context, input ShowChangesInput) (Chan
 	}
 	result := ChangesResult{}
 	var text strings.Builder
-	for _, line := range strings.Split(strings.TrimSuffix(status, "\n"), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSuffix(status, "\n"), "\n") {
 		if line == "" {
 			continue
 		}
 		result.FilesChanged++
-		if strings.HasPrefix(line, "?? ") {
-			result.Untracked = append(result.Untracked, strings.TrimPrefix(line, "?? "))
+		if after, ok := strings.CutPrefix(line, "?? "); ok {
+			result.Untracked = append(result.Untracked, after)
 		}
 	}
 	diffArgs := append([]string{"diff", "HEAD"}, pathspec...)
@@ -91,7 +91,7 @@ func (s *Service) ShowChanges(ctx context.Context, input ShowChangesInput) (Chan
 	if statErr != nil {
 		return ChangesResult{}, fmt.Errorf("read Git diff stat: %w", statErr)
 	}
-	for _, line := range strings.Split(stat, "\n") {
+	for line := range strings.SplitSeq(stat, "\n") {
 		fields := strings.Split(line, "\t")
 		if len(fields) < 2 {
 			continue

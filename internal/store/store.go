@@ -198,7 +198,7 @@ func (s *Store) ConsumeCode(hash []byte, now time.Time) (AuthorizationCode, erro
 	if err != nil {
 		return AuthorizationCode{}, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var code AuthorizationCode
 	var expiresAt int64
@@ -239,7 +239,7 @@ func (s *Store) ApproveCode(hash []byte) (AuthorizationCode, error) {
 	if err != nil {
 		return AuthorizationCode{}, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var code AuthorizationCode
 	var expiresAt int64
 	var consumedAt sql.NullInt64
@@ -336,7 +336,7 @@ func (s *Store) RotateRefreshToken(oldHash []byte, replacement RefreshToken, now
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var expiresAt int64
 	var rotatedAt sql.NullInt64
 	if err := tx.QueryRow(`
@@ -361,6 +361,23 @@ VALUES (?, ?, ?, ?, ?)`, replacement.Hash, replacement.ClientID, replacement.Sco
 		return err
 	}
 	return tx.Commit()
+}
+
+// PurgeExpired deletes authorization codes and tokens that expired before now.
+// Nothing else removes them, so without this the database grows without bound
+// and retains credential hashes long after they stop being usable.
+func (s *Store) PurgeExpired(now time.Time) error {
+	cutoff := now.Unix()
+	for _, statement := range []string{
+		`DELETE FROM oauth_codes WHERE expires_at <= ?`,
+		`DELETE FROM oauth_access_tokens WHERE expires_at <= ?`,
+		`DELETE FROM oauth_refresh_tokens WHERE expires_at <= ?`,
+	} {
+		if _, err := s.db.Exec(statement, cutoff); err != nil {
+			return fmt.Errorf("purge expired records: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) PutWorkspace(record WorkspaceRecord) error {
@@ -443,6 +460,7 @@ CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
   expires_at INTEGER NOT NULL,
   rotated_at INTEGER
 );
+CREATE INDEX IF NOT EXISTS oauth_refresh_tokens_expires_at_idx ON oauth_refresh_tokens(expires_at);
 CREATE TABLE IF NOT EXISTS workspaces (
   workspace_id TEXT PRIMARY KEY,
   root TEXT NOT NULL,

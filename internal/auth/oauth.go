@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -16,11 +18,70 @@ import (
 )
 
 var (
-	ErrInvalidClient  = errors.New("invalid client")
-	ErrInvalidGrant   = errors.New("invalid grant")
-	ErrInvalidRequest = errors.New("invalid request")
-	ErrUnauthorized   = errors.New("unauthorized")
+	ErrInvalidClient   = errors.New("invalid client")
+	ErrInvalidGrant    = errors.New("invalid grant")
+	ErrInvalidRequest  = errors.New("invalid request")
+	ErrUnauthorized    = errors.New("unauthorized")
+	ErrTooManyAttempts = errors.New("too many failed approval attempts")
 )
+
+const (
+	// The owner password may be as short as four characters and the approval
+	// endpoint is reachable through the public tunnel, so cap how fast it can
+	// be guessed. Argon2 alone only makes each guess expensive, not bounded.
+	maxApprovalAttempts = 5
+	approvalLockout     = 15 * time.Minute
+)
+
+// RedirectableError is an authorization failure that RFC 6749 4.1.2.1 requires
+// be delivered to the client's redirect URI. It is only produced after the
+// client and its redirect URI have been validated.
+type RedirectableError struct {
+	RedirectURI string
+	State       string
+	Code        string
+	Description string
+}
+
+func (e *RedirectableError) Error() string {
+	return e.Code + ": " + e.Description
+}
+
+// RedirectURL renders the redirect URI carrying the OAuth error parameters.
+func (e *RedirectableError) RedirectURL() string {
+	target, err := url.Parse(e.RedirectURI)
+	if err != nil {
+		return e.RedirectURI
+	}
+	query := target.Query()
+	query.Set("error", e.Code)
+	if e.Description != "" {
+		query.Set("error_description", e.Description)
+	}
+	if e.State != "" {
+		query.Set("state", e.State)
+	}
+	target.RawQuery = query.Encode()
+	return target.String()
+}
+
+// sameResource compares RFC 8707 resource indicators. The MCP specification
+// says to accept case variation in scheme and host and to tolerate a trailing
+// slash, so a byte-exact match would reject conformant clients.
+func sameResource(left, right string) bool {
+	return canonicalResource(left) == canonicalResource(right)
+}
+
+func canonicalResource(value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return strings.TrimRight(value, "/")
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return parsed.String()
+}
 
 type Provider struct {
 	Store         *store.Store
@@ -28,6 +89,11 @@ type Provider struct {
 	AccessTTL     time.Duration
 	RefreshTTL    time.Duration
 	RedirectHosts []string
+
+	// Approval throttling. There is a single owner, so one counter is enough.
+	approvalMu       sync.Mutex
+	approvalFailures int
+	approvalBlocked  time.Time
 }
 
 type Client struct {
@@ -146,26 +212,42 @@ func (p *Provider) BeginAuthorization(input AuthorizationInput) (AuthorizationPa
 	if err != nil {
 		return AuthorizationPage{}, ErrInvalidClient
 	}
-	if !contains(client.RedirectURIs, input.RedirectURI) || input.ResponseType != "code" {
+	// The redirect URI must be validated before any error can be sent to it,
+	// otherwise the error path itself becomes an open redirect.
+	if !slices.Contains(client.RedirectURIs, input.RedirectURI) {
 		return AuthorizationPage{}, ErrInvalidRequest
+	}
+	// From here the client and redirect URI are trusted, so RFC 6749 4.1.2.1
+	// wants failures reported back to the client rather than rendered here.
+	redirectErr := func(code, description string) error {
+		return &RedirectableError{
+			RedirectURI: input.RedirectURI, State: input.State,
+			Code: code, Description: description,
+		}
+	}
+	if input.ResponseType != "code" {
+		return AuthorizationPage{}, redirectErr("unsupported_response_type", "response_type must be code")
 	}
 	scope := input.Scope
 	if scope == "" {
 		scope = "devspace"
 	}
-	if !contains(strings.Fields(scope), "devspace") || input.CodeChallenge == "" || input.CodeChallengeMethod != "S256" {
-		return AuthorizationPage{}, ErrInvalidRequest
+	if !slices.Contains(strings.Fields(scope), "devspace") {
+		return AuthorizationPage{}, redirectErr("invalid_scope", "scope must include devspace")
+	}
+	if input.CodeChallenge == "" || input.CodeChallengeMethod != "S256" {
+		return AuthorizationPage{}, redirectErr("invalid_request", "PKCE with S256 is required")
 	}
 	resource := input.Resource
 	if resource == "" {
 		resource = p.ResourceURL()
 	}
-	if resource != p.ResourceURL() {
-		return AuthorizationPage{}, ErrInvalidRequest
+	if !sameResource(resource, p.ResourceURL()) {
+		return AuthorizationPage{}, redirectErr("invalid_target", "resource does not match this server")
 	}
 	code, err := randomToken(32)
 	if err != nil {
-		return AuthorizationPage{}, err
+		return AuthorizationPage{}, redirectErr("server_error", "could not create authorization code")
 	}
 	if err := p.Store.CreateCode(store.AuthorizationCode{
 		Hash:                hashToken(code),
@@ -187,13 +269,18 @@ func (p *Provider) BeginAuthorization(input AuthorizationInput) (AuthorizationPa
 }
 
 func (p *Provider) Approve(approvalID, password string) (string, error) {
+	if err := p.checkApprovalAllowed(time.Now()); err != nil {
+		return "", err
+	}
 	hash, err := p.Store.OwnerHash()
 	if err != nil {
 		return "", ErrUnauthorized
 	}
 	if !VerifyPassword(hash, []byte(password)) {
+		p.recordApprovalFailure(time.Now())
 		return "", ErrUnauthorized
 	}
+	p.resetApprovalFailures()
 	code, err := p.Store.ApproveCode(hashToken(approvalID))
 	if err != nil {
 		return "", ErrInvalidGrant
@@ -211,9 +298,43 @@ func (p *Provider) Approve(approvalID, password string) (string, error) {
 	return redirect.String(), nil
 }
 
+// checkApprovalAllowed reports whether another owner-password attempt may be
+// made, refusing every attempt while a lockout is in effect so that a correct
+// guess arriving mid-lockout still fails.
+func (p *Provider) checkApprovalAllowed(now time.Time) error {
+	p.approvalMu.Lock()
+	defer p.approvalMu.Unlock()
+	if p.approvalBlocked.IsZero() {
+		return nil
+	}
+	if now.Before(p.approvalBlocked) {
+		return ErrTooManyAttempts
+	}
+	// The lockout elapsed; start a fresh budget.
+	p.approvalBlocked = time.Time{}
+	p.approvalFailures = 0
+	return nil
+}
+
+func (p *Provider) recordApprovalFailure(now time.Time) {
+	p.approvalMu.Lock()
+	defer p.approvalMu.Unlock()
+	p.approvalFailures++
+	if p.approvalFailures >= maxApprovalAttempts {
+		p.approvalBlocked = now.Add(approvalLockout)
+	}
+}
+
+func (p *Provider) resetApprovalFailures() {
+	p.approvalMu.Lock()
+	defer p.approvalMu.Unlock()
+	p.approvalFailures = 0
+	p.approvalBlocked = time.Time{}
+}
+
 func (p *Provider) ExchangeCode(input TokenInput) (TokenResponse, error) {
 	if input.ClientID == "" || input.Code == "" || input.RedirectURI == "" || input.CodeVerifier == "" {
-		return TokenResponse{}, ErrInvalidGrant
+		return TokenResponse{}, fmt.Errorf("%w: missing required token parameter", ErrInvalidRequest)
 	}
 	code, err := p.Store.GetAuthorizationCode(hashToken(input.Code), time.Now())
 	if err != nil || code.ClientID != input.ClientID || code.RedirectURI != input.RedirectURI {
@@ -226,7 +347,7 @@ func (p *Provider) ExchangeCode(input TokenInput) (TokenResponse, error) {
 	if resource == "" {
 		resource = code.Resource
 	}
-	if resource != code.Resource {
+	if !sameResource(resource, code.Resource) {
 		return TokenResponse{}, ErrInvalidGrant
 	}
 	if _, err := p.Store.ConsumeCode(hashToken(input.Code), time.Now()); err != nil {
@@ -237,7 +358,7 @@ func (p *Provider) ExchangeCode(input TokenInput) (TokenResponse, error) {
 
 func (p *Provider) Refresh(input TokenInput) (TokenResponse, error) {
 	if input.ClientID == "" || input.RefreshToken == "" {
-		return TokenResponse{}, ErrInvalidGrant
+		return TokenResponse{}, fmt.Errorf("%w: missing required token parameter", ErrInvalidRequest)
 	}
 	old, err := p.Store.GetRefreshToken(hashToken(input.RefreshToken), time.Now())
 	if err != nil || old.ClientID != input.ClientID {
@@ -247,7 +368,7 @@ func (p *Provider) Refresh(input TokenInput) (TokenResponse, error) {
 	if resource == "" {
 		resource = old.Resource
 	}
-	if resource != old.Resource {
+	if !sameResource(resource, old.Resource) {
 		return TokenResponse{}, ErrInvalidGrant
 	}
 	response, err := p.issueRefreshedTokens(old, input.RefreshToken)
@@ -259,7 +380,7 @@ func (p *Provider) Refresh(input TokenInput) (TokenResponse, error) {
 
 func (p *Provider) AuthenticateBearer(raw, resource string) error {
 	token, err := p.Store.GetAccessToken(hashToken(raw), time.Now())
-	if err != nil || token.Resource != resource {
+	if err != nil || !sameResource(token.Resource, resource) {
 		return ErrUnauthorized
 	}
 	return nil
@@ -351,13 +472,4 @@ func verifyPKCE(challenge, verifier string) bool {
 	hash := sha256.Sum256([]byte(verifier))
 	computed := base64.RawURLEncoding.EncodeToString(hash[:])
 	return subtle.ConstantTimeCompare([]byte(challenge), []byte(computed)) == 1
-}
-
-func contains(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }

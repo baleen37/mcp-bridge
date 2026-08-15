@@ -92,8 +92,8 @@ func TestArtifactDownloadIsConditionallyListed(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Result.Tools) != 7 {
-		t.Fatalf("tools = %d, want 7", len(result.Result.Tools))
+	if len(result.Result.Tools) != 9 {
+		t.Fatalf("tools = %d, want 9", len(result.Result.Tools))
 	}
 }
 
@@ -209,7 +209,7 @@ func TestRequestLoggerRedactsCredentials(t *testing.T) {
 	}
 }
 
-func TestAuthorizedMCPListsSevenTools(t *testing.T) {
+func TestAuthorizedMCPListsNineTools(t *testing.T) {
 	server, provider, _ := testHTTPServerWithArtifacts(t, true)
 	client, err := provider.RegisterClient(auth.RegisterInput{Name: "test", RedirectURIs: []string{"https://chatgpt.com/callback"}})
 	if err != nil {
@@ -285,14 +285,14 @@ func TestAuthorizedMCPListsSevenTools(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != http.StatusOK || len(result.Result.Tools) != 7 {
+	if response.StatusCode != http.StatusOK || len(result.Result.Tools) != 9 {
 		t.Fatalf("tools/list status=%d tools=%d result=%#v", response.StatusCode, len(result.Result.Tools), result)
 	}
 	seen := map[string]bool{}
 	for _, tool := range result.Result.Tools {
 		seen[tool.Name] = true
 	}
-	for _, name := range []string{"open_workspace", "read_file", "grep_files", "list_dir", "apply_patch", "exec_command", "download_artifact"} {
+	for _, name := range []string{"open_workspace", "read_file", "write_file", "grep_files", "list_dir", "show_changes", "apply_patch", "exec_command", "download_artifact"} {
 		if !seen[name] {
 			t.Errorf("missing tool %q", name)
 		}
@@ -316,7 +316,7 @@ func TestToolsExposeMinimalPublicSchemas(t *testing.T) {
 	if err := json.Unmarshal(body, &response); err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"apply_patch", "download_artifact", "exec_command", "grep_files", "list_dir", "open_workspace", "read_file"}
+	wantNames := []string{"apply_patch", "download_artifact", "exec_command", "grep_files", "list_dir", "open_workspace", "read_file", "show_changes", "write_file"}
 	if len(response.Result.Tools) != len(wantNames) {
 		t.Fatalf("tools = %d, want %d", len(response.Result.Tools), len(wantNames))
 	}
@@ -340,6 +340,8 @@ func TestToolsExposeMinimalPublicSchemas(t *testing.T) {
 			"apply_patch":       {"text"},
 			"exec_command":      {"text", "exit_code", "truncated", "timed_out"},
 			"download_artifact": {"text", "sha256"},
+			"show_changes":      {"text", "files_changed", "additions", "deletions", "untracked", "truncated"},
+			"write_file":        {"text"},
 		}[want]
 		if len(properties) != len(wantFields) {
 			t.Fatalf("%s output properties = %#v, want %v", want, properties, wantFields)
@@ -362,6 +364,59 @@ func TestToolsExposeMinimalPublicSchemas(t *testing.T) {
 		for field := range properties {
 			if !allowedExecInputs[field] {
 				t.Fatalf("unexpected exec input %q", field)
+			}
+		}
+	}
+}
+
+func TestShowChangesAndWriteFileAreRegistered(t *testing.T) {
+	server, provider, _ := testHTTPServer(t)
+	tokens := issueTestToken(t, provider)
+	callMCP(t, server.URL, tokens.AccessToken, `{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	body := callMCP(t, server.URL, tokens.AccessToken, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	var response struct {
+		Result struct {
+			Tools []struct {
+				Name        string         `json:"name"`
+				Description string         `json:"description"`
+				InputSchema map[string]any `json:"inputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]struct {
+		Name        string         `json:"name"`
+		Description string         `json:"description"`
+		InputSchema map[string]any `json:"inputSchema"`
+	}{}
+	for _, tool := range response.Result.Tools {
+		found[tool.Name] = tool
+	}
+	wantInputs := map[string][]string{
+		"show_changes": {"workspace_id", "path"},
+		"write_file":   {"workspace_id", "path", "content"},
+	}
+	for name, wantFields := range wantInputs {
+		tool, ok := found[name]
+		if !ok {
+			t.Fatalf("missing tool %q", name)
+		}
+		if tool.Description == "" {
+			t.Errorf("%s has an empty description", name)
+		}
+		properties, ok := tool.InputSchema["properties"].(map[string]any)
+		if !ok || len(properties) != len(wantFields) {
+			t.Fatalf("%s input schema = %#v, want fields %v", name, tool.InputSchema, wantFields)
+		}
+		for _, field := range wantFields {
+			property, ok := properties[field].(map[string]any)
+			if !ok {
+				t.Fatalf("%s missing input field %q", name, field)
+			}
+			if property["description"] == "" || property["description"] == nil {
+				t.Errorf("%s input field %q has no description", name, field)
 			}
 		}
 	}
@@ -457,7 +512,7 @@ func TestModernMCPUsesStatelessTransport(t *testing.T) {
 	if err := json.Unmarshal(body, &result); err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != http.StatusOK || len(result.Result.Tools) != 6 {
+	if response.StatusCode != http.StatusOK || len(result.Result.Tools) != 8 {
 		t.Fatalf("tools/list status=%d tools=%d result=%#v", response.StatusCode, len(result.Result.Tools), result)
 	}
 }
@@ -558,5 +613,142 @@ func TestAuthorizedMCPAllowsConfiguredPublicHost(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(response.Body)
 		t.Fatalf("configured public host status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestUsesModernTransportIgnoresUnknownVersions(t *testing.T) {
+	for _, testCase := range []struct {
+		version string
+		want    bool
+	}{
+		{version: "2026-07-28", want: true},
+		{version: "2025-11-25", want: false},
+		{version: "2025-06-18", want: false},
+		{version: "2024-11-05", want: false},
+		{version: "", want: false},
+		// Unrecognized values sort above every real revision as plain strings,
+		// so they must be rejected by the allow-list rather than compared.
+		{version: "garbage", want: false},
+		{version: "9", want: false},
+		{version: "2099-01-01", want: false},
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		if testCase.version != "" {
+			request.Header.Set("Mcp-Protocol-Version", testCase.version)
+		}
+		if got := usesModernTransport(request); got != testCase.want {
+			t.Errorf("usesModernTransport(%q) = %v, want %v", testCase.version, got, testCase.want)
+		}
+	}
+}
+
+func TestTokenResponsesAreNotCacheable(t *testing.T) {
+	server, provider, _ := testHTTPServer(t)
+	_ = provider
+
+	form := url.Values{"grant_type": {"authorization_code"}}
+	response, err := http.PostForm(server.URL+"/token", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if got := response.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want %q (RFC 6749 5.1)", got, "no-store")
+	}
+	if got := response.Header.Get("Pragma"); got != "no-cache" {
+		t.Errorf("Pragma = %q, want %q", got, "no-cache")
+	}
+}
+
+func TestTokenEndpointDistinguishesMissingParameters(t *testing.T) {
+	server, _, _ := testHTTPServer(t)
+
+	for _, testCase := range []struct {
+		name string
+		form url.Values
+		want string
+	}{
+		{
+			name: "missing parameters",
+			form: url.Values{"grant_type": {"authorization_code"}},
+			want: "invalid_request",
+		},
+		{
+			name: "unknown grant type",
+			form: url.Values{"grant_type": {"password"}},
+			want: "unsupported_grant_type",
+		},
+		{
+			name: "complete but bogus grant",
+			form: url.Values{
+				"grant_type":    {"authorization_code"},
+				"client_id":     {"nope"},
+				"code":          {"nope"},
+				"redirect_uri":  {"https://chatgpt.com/cb"},
+				"code_verifier": {"nope"},
+			},
+			want: "invalid_grant",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			response, err := http.PostForm(server.URL+"/token", testCase.form)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			var payload struct {
+				Error string `json:"error"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Error != testCase.want {
+				t.Errorf("error = %q, want %q", payload.Error, testCase.want)
+			}
+		})
+	}
+}
+
+func TestMethodMismatchReturns405WithAllowHeader(t *testing.T) {
+	server, _, _ := testHTTPServer(t)
+
+	for _, testCase := range []struct {
+		method, path, wantAllow string
+	}{
+		{http.MethodPost, "/healthz", "GET"},
+		{http.MethodGet, "/token", "POST"},
+		{http.MethodGet, "/register", "POST"},
+	} {
+		request, err := http.NewRequest(testCase.method, server.URL+testCase.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s: status = %d, want 405", testCase.method, testCase.path, response.StatusCode)
+		}
+		if got := response.Header.Get("Allow"); !strings.Contains(got, testCase.wantAllow) {
+			t.Errorf("%s %s: Allow = %q, want it to contain %q", testCase.method, testCase.path, got, testCase.wantAllow)
+		}
+	}
+}
+
+func TestHealthzAnswersHEAD(t *testing.T) {
+	server, _, _ := testHTTPServer(t)
+	request, err := http.NewRequest(http.MethodHead, server.URL+"/healthz", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Errorf("HEAD /healthz status = %d, want 200", response.StatusCode)
 	}
 }

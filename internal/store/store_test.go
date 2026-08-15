@@ -141,3 +141,46 @@ func TestWorkspaceRoundTrip(t *testing.T) {
 		t.Fatalf("workspace = %#v, want %#v", got, want)
 	}
 }
+
+func TestPurgeExpiredRemovesOnlyExpiredRecords(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.CreateClient(Client{ID: "c1", Name: "test", RedirectURIs: []string{"https://example.test/cb"}}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	live := now.Add(time.Hour)
+	dead := now.Add(-time.Hour)
+
+	if err := s.CreateAccessToken(AccessToken{Hash: []byte("live-access"), ClientID: "c1", Scope: "devspace", Resource: "r", ExpiresAt: live}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAccessToken(AccessToken{Hash: []byte("dead-access"), ClientID: "c1", Scope: "devspace", Resource: "r", ExpiresAt: dead}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateRefreshToken(RefreshToken{Hash: []byte("dead-refresh"), ClientID: "c1", Scope: "devspace", Resource: "r", ExpiresAt: dead}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateCode(AuthorizationCode{Hash: []byte("dead-code"), ClientID: "c1", RedirectURI: "https://example.test/cb", ExpiresAt: dead}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.PurgeExpired(now); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.GetAccessToken([]byte("live-access"), now); err != nil {
+		t.Errorf("unexpired access token was removed: %v", err)
+	}
+	for _, expired := range []struct {
+		name string
+		get  func() error
+	}{
+		{"access", func() error { _, err := s.GetAccessToken([]byte("dead-access"), now); return err }},
+		{"refresh", func() error { _, err := s.GetRefreshToken([]byte("dead-refresh"), now); return err }},
+		{"code", func() error { _, err := s.GetAuthorizationCode([]byte("dead-code"), now); return err }},
+	} {
+		if err := expired.get(); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expired %s: err = %v, want ErrNotFound (row should be deleted)", expired.name, err)
+		}
+	}
+}

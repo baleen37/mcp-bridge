@@ -275,7 +275,7 @@ func writePID(runtimeDir, name string, record pidRecord) error {
 	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
 		return fmt.Errorf("create PID directory: %w", err)
 	}
-	payload := []byte(fmt.Sprintf("{\"pid\":%d,\"expected\":%q}\n", record.PID, record.Expected))
+	payload := fmt.Appendf(nil, "{\"pid\":%d,\"expected\":%q}\n", record.PID, record.Expected)
 	path := filepath.Join(runtimeDir, name+".pid")
 	temporary, err := os.CreateTemp(runtimeDir, ".pid-*")
 	if err != nil {
@@ -321,7 +321,7 @@ func removePID(runtimeDir, name string) error {
 }
 
 func commandHasBinary(command, expected string) bool {
-	for _, field := range strings.Fields(command) {
+	for field := range strings.FieldsSeq(command) {
 		field = strings.Trim(field, "\"'")
 		if filepath.Base(field) == expected {
 			return true
@@ -341,7 +341,7 @@ func waitForHealth(ctx context.Context, address string) error {
 		if err == nil {
 			response, requestErr := client.Do(request)
 			if requestErr == nil {
-				response.Body.Close()
+				_ = response.Body.Close()
 				if response.StatusCode == http.StatusOK {
 					return nil
 				}
